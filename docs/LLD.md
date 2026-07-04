@@ -903,6 +903,112 @@ if pending == 0:
 
 ---
 
+## Phase 3B — Soulseek (Alternative, Deferred)
+
+> **Decision deferred until Phase 2 is complete.** After Phase 2, run the album-value query
+> below to decide which path makes sense. Do not build Phase 3B until then.
+
+### Why Soulseek
+
+Lidarr/Prowlarr downloads **full albums** — typically 300–800MB per album. If you need only
+1 track from a 12-track album, 90%+ of bandwidth is waste. Soulseek allows searching and
+downloading **individual tracks** — common on the network, especially for FLAC.
+
+### Tradeoffs
+
+| | Phase 3A (Lidarr) | Phase 3B (Soulseek) |
+|---|---|---|
+| Search unit | Full album | Individual track |
+| Typical download size | 300–800MB / album | 20–60MB / track |
+| FLAC availability | High (torrent trackers) | High (peer library sharing) |
+| Automation | Full API (Lidarr REST) | Limited — nicotine+ has CLI/API; slskd has REST API |
+| VPN support | Yes (Gluetun kill switch) | Yes (route nicotine+ or slskd through Gluetun) |
+| Speed | Fast (torrents seed well) | Slower (depends on peers online) |
+| Reliability | High | Variable — peer must be online |
+
+### Decision Query (run after Phase 2)
+
+```sql
+-- For each album in your library: how many tracks do you have vs total tracks on MB release?
+-- Use this to decide Lidarr vs Soulseek per album.
+
+SELECT
+    verified_album,
+    verified_artist,
+    release_group_mbid,
+    COUNT(*)                              AS tracks_you_have,
+    -- ratio: if low, Soulseek is better; if high, Lidarr full-album download is worth it
+    ROUND(COUNT(*) * 100.0 / 12, 0)      AS est_pct_of_album  -- adjust 12 to real album track count
+FROM music.tracks
+WHERE status = 'verified'
+GROUP BY verified_album, verified_artist, release_group_mbid
+ORDER BY tracks_you_have ASC;
+```
+
+Rule of thumb:
+- `tracks_you_have >= 6` → Lidarr (Phase 3A) — worth downloading full album
+- `tracks_you_have < 6` → Soulseek (Phase 3B) — download individual tracks only
+
+### Soulseek Client: slskd
+
+`slskd` is a headless Soulseek client with a REST API — automatable from Python.
+Runs as a Docker container. Alternative: `nicotine+` (GUI, limited automation).
+
+```
+slskd REST API base: http://localhost:5030/api/v0
+Auth: Bearer token (configured in slskd.yml)
+```
+
+### Schema additions (when Phase 3B is built)
+
+Add column to `music.tracks`:
+
+```sql
+ALTER TABLE music.tracks
+ADD COLUMN download_source VARCHAR(20)
+    CHECK (download_source IN ('lidarr', 'soulseek'))
+    DEFAULT 'lidarr';
+```
+
+Add status values (migration required — ALTER TYPE):
+
+```sql
+-- New statuses for Soulseek path
+ALTER TYPE music.track_status ADD VALUE 'slsk_searching'  AFTER 'queued';
+ALTER TYPE music.track_status ADD VALUE 'slsk_downloading' AFTER 'slsk_searching';
+-- Existing 'converting', 'done', 'failed', 'permanent_failed' reused as-is
+```
+
+### Phase 3B Processing Logic (sketch — not yet designed in detail)
+
+```
+for each verified track where download_source = 'soulseek':
+    search slskd: GET /api/v0/searches with query="{artist} {title}"
+    filter results: FLAC only, size 20–100MB, peer speed > threshold
+    pick best result (highest quality, fastest peer)
+    POST /api/v0/transfers/downloads/{username} to start download
+    poll GET /api/v0/transfers/downloads until complete
+    locate downloaded FLAC file
+    verify by duration ± 3s
+    FFmpeg FLAC → AAC 256k (same as Phase 3A)
+    status = done
+```
+
+### VPN for Soulseek
+
+Route slskd container through Gluetun (same pattern as qBittorrent):
+
+```yaml
+slskd:
+  image: slskd/slskd
+  network_mode: "service:gluetun"   # all traffic via VPN
+  ports: []                          # ports exposed via Gluetun
+```
+
+Gluetun must expose slskd's port (default 5030) in addition to qBittorrent's 8080.
+
+---
+
 ## Docker Compose (`docker-compose.yml`)
 
 ```yaml

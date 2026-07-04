@@ -903,109 +903,260 @@ if pending == 0:
 
 ---
 
-## Phase 3B — Soulseek (Alternative, Deferred)
+## Phase 3 — Download Strategy
 
-> **Decision deferred until Phase 2 is complete.** After Phase 2, run the album-value query
-> below to decide which path makes sense. Do not build Phase 3B until then.
+### Overview
 
-### Why Soulseek
+Library pattern: individual favourite tracks, not full albums.
+Downloading full albums (300–800MB) to extract one track is wasteful.
 
-Lidarr/Prowlarr downloads **full albums** — typically 300–800MB per album. If you need only
-1 track from a 12-track album, 90%+ of bandwidth is waste. Soulseek allows searching and
-downloading **individual tracks** — common on the network, especially for FLAC.
+**Primary: Soulseek (slskd)** — search and download individual FLAC tracks (~30MB each).
+**Fallback: Lidarr** — if Soulseek finds nothing after 48h, download full album, extract track.
+
+```
+verified
+   │
+   ▼
+Phase 3A: Soulseek search → individual FLAC track (~30MB)
+   │
+   ├── found + verified → FFmpeg → done
+   │
+   └── not found after 48h
+         │
+         ▼
+       Phase 3B: Lidarr full album (~500MB) → extract matching track → FFmpeg → done
+         │
+         └── not found after 48h → permanent_failed
+```
+
+### Why Tagging (Phase 2) is Critical for Search Quality
+
+beets corrects tags via MusicBrainz before any search happens. This matters because:
+
+- Raw MP3 tags are often garbage: `"01 - track1"`, wrong spelling, featuring-artist variations
+- beets normalizes to canonical MusicBrainz names: `verified_artist = "Queen"`, `verified_title = "Bohemian Rhapsody"`
+- Search query to Soulseek uses `verified_artist + verified_title` — clean, unambiguous
+
+**Recording ID verification**: after downloading a FLAC from Soulseek, check its
+`MUSICBRAINZ_TRACKID` Vorbis tag against our `recording_mbid`. Serious collectors tag their
+FLAC libraries with beets — matching Recording ID confirms it is the exact studio recording,
+not a live version, cover, or remaster with different mastering. If ID absent or mismatched,
+fall back to duration check (±3s) as secondary verification.
 
 ### Tradeoffs
 
-| | Phase 3A (Lidarr) | Phase 3B (Soulseek) |
+| | Phase 3A (Soulseek) | Phase 3B (Lidarr fallback) |
 |---|---|---|
-| Search unit | Full album | Individual track |
-| Typical download size | 300–800MB / album | 20–60MB / track |
-| FLAC availability | High (torrent trackers) | High (peer library sharing) |
-| Automation | Full API (Lidarr REST) | Limited — nicotine+ has CLI/API; slskd has REST API |
-| VPN support | Yes (Gluetun kill switch) | Yes (route nicotine+ or slskd through Gluetun) |
-| Speed | Fast (torrents seed well) | Slower (depends on peers online) |
-| Reliability | High | Variable — peer must be online |
+| Search unit | Individual track | Full album |
+| Typical size | 20–60MB / track | 300–800MB / album |
+| FLAC availability | High for popular tracks | High on torrent trackers |
+| Automation | slskd REST API | Lidarr REST API |
+| VPN | Gluetun (same container pattern) | Gluetun (existing qBittorrent) |
+| Speed | Peer-dependent | Fast (torrents seed well) |
+| Reliability | Variable (peer must be online) | High |
 
-### Decision Query (run after Phase 2)
+---
 
-```sql
--- For each album in your library: how many tracks do you have vs total tracks on MB release?
--- Use this to decide Lidarr vs Soulseek per album.
-
-SELECT
-    verified_album,
-    verified_artist,
-    release_group_mbid,
-    COUNT(*)                              AS tracks_you_have,
-    -- ratio: if low, Soulseek is better; if high, Lidarr full-album download is worth it
-    ROUND(COUNT(*) * 100.0 / 12, 0)      AS est_pct_of_album  -- adjust 12 to real album track count
-FROM music.tracks
-WHERE status = 'verified'
-GROUP BY verified_album, verified_artist, release_group_mbid
-ORDER BY tracks_you_have ASC;
-```
-
-Rule of thumb:
-- `tracks_you_have >= 6` → Lidarr (Phase 3A) — worth downloading full album
-- `tracks_you_have < 6` → Soulseek (Phase 3B) — download individual tracks only
+## Phase 3A — Soulseek Primary
 
 ### Soulseek Client: slskd
 
-`slskd` is a headless Soulseek client with a REST API — automatable from Python.
-Runs as a Docker container. Alternative: `nicotine+` (GUI, limited automation).
+`slskd` is a headless Soulseek client with a REST API — fully automatable from Python.
+Runs as Docker container inside Gluetun VPN namespace.
 
 ```
 slskd REST API base: http://localhost:5030/api/v0
-Auth: Bearer token (configured in slskd.yml)
+Auth: Bearer token (set in slskd.yml, read from .env as SLSKD_API_KEY)
 ```
 
-### Schema additions (when Phase 3B is built)
-
-Add column to `music.tracks`:
+### Schema Additions for Phase 3
 
 ```sql
+-- Migration: run before Phase 3 build
 ALTER TABLE music.tracks
 ADD COLUMN download_source VARCHAR(20)
-    CHECK (download_source IN ('lidarr', 'soulseek'))
-    DEFAULT 'lidarr';
-```
+    CHECK (download_source IN ('soulseek', 'lidarr'))
+    DEFAULT 'soulseek';   -- attempt Soulseek first for every track
 
-Add status values (migration required — ALTER TYPE):
-
-```sql
--- New statuses for Soulseek path
-ALTER TYPE music.track_status ADD VALUE 'slsk_searching'  AFTER 'queued';
+ALTER TYPE music.track_status ADD VALUE 'slsk_searching'   AFTER 'queued';
 ALTER TYPE music.track_status ADD VALUE 'slsk_downloading' AFTER 'slsk_searching';
--- Existing 'converting', 'done', 'failed', 'permanent_failed' reused as-is
+-- 'converting', 'done', 'failed', 'permanent_failed' reused as-is for both paths
 ```
 
-### Phase 3B Processing Logic (sketch — not yet designed in detail)
+### Updated State Machine (Phase 3)
 
 ```
-for each verified track where download_source = 'soulseek':
-    search slskd: GET /api/v0/searches with query="{artist} {title}"
-    filter results: FLAC only, size 20–100MB, peer speed > threshold
-    pick best result (highest quality, fastest peer)
-    POST /api/v0/transfers/downloads/{username} to start download
-    poll GET /api/v0/transfers/downloads until complete
-    locate downloaded FLAC file
-    verify by duration ± 3s
-    FFmpeg FLAC → AAC 256k (same as Phase 3A)
-    status = done
+verified
+   │
+   ▼
+slsk_searching   (slskd search triggered)
+   │
+   ├── result found → slsk_downloading → converting → done
+   │
+   └── no result after 48h → queued (Lidarr fallback path)
+                                │
+                                ▼
+                           downloading (Lidarr/qBittorrent)
+                                │
+                                ├── track extracted → converting → done
+                                └── failed / timeout → permanent_failed
 ```
 
-### VPN for Soulseek
+### Search Query Construction
 
-Route slskd container through Gluetun (same pattern as qBittorrent):
+```python
+def build_search_query(track) -> str:
+    artist = track.verified_artist or track.raw_artist
+    title  = track.verified_title  or track.raw_title
+    # Do NOT include album — too restrictive, misses compilations/singles
+    # Do NOT include year — version differences on Soulseek
+    return f"{artist} {title}"   # e.g. "Queen Bohemian Rhapsody"
+```
+
+### Processing Logic
+
+```python
+# Step 1: Trigger search
+search_id = POST /api/v0/searches
+            body: { "searchText": build_search_query(track), "fileCount": 100 }
+UPDATE status = 'slsk_searching', download_queued_at = NOW()
+
+# Step 2: Wait for results (slskd searches are async, ~15-30s)
+time.sleep(30)
+results = GET /api/v0/searches/{search_id}/responses
+
+# Step 3: Filter and rank results
+candidates = []
+for peer_response in results:
+    for file in peer_response['files']:
+        if not file['filename'].lower().endswith('.flac'):
+            continue
+        if file['size'] < 10_000_000:       # < 10MB — likely corrupt/wrong
+            continue
+        if file['size'] > 150_000_000:      # > 150MB — likely whole album mislabelled
+            continue
+        candidates.append({
+            'username': peer_response['username'],
+            'filename': file['filename'],
+            'size':     file['size'],
+            'speed':    peer_response['uploadSpeed'],  # bytes/sec
+            'file':     file,
+        })
+
+if not candidates:
+    # No FLAC results — check timeout then maybe retry or fall back to Lidarr
+    handle_no_results(track)
+    return
+
+# Step 4: Pick best — prioritise speed, then size (bigger FLAC = less compressed)
+best = sorted(candidates, key=lambda c: (-c['speed'], -c['size']))[0]
+
+# Step 5: Enqueue download
+POST /api/v0/transfers/downloads/{best['username']}
+body: [{ "filename": best['filename'], "size": best['size'] }]
+UPDATE status = 'slsk_downloading', flac_temp_path = expected_local_path(best['filename'])
+
+# Step 6: Poll download progress
+while True:
+    time.sleep(30)
+    transfers = GET /api/v0/transfers/downloads/{best['username']}
+    match = find transfer for our filename
+    if match['state'] == 'Completed':
+        break
+    if match['state'] in ('Errored', 'Rejected', 'TimedOut'):
+        retry with next candidate or mark failed
+        return
+    if (NOW() - download_queued_at) > 48h:
+        handle_timeout(track)   # fall back to Lidarr
+        return
+
+# Step 7: Verify downloaded FLAC
+flac_path = SLSKD_DOWNLOAD_DIR / best['filename']
+tags = FLAC(flac_path)
+mbid_in_file = tags.get('MUSICBRAINZ_TRACKID', [None])[0]
+
+if mbid_in_file and mbid_in_file.lower() == track.recording_mbid.lower():
+    # Perfect match — confirmed correct recording
+    pass
+else:
+    # No MBID in file — fall back to duration check
+    flac_duration = FLAC(flac_path).info.length
+    if abs(flac_duration - track.duration_sec) > 3:
+        logger.warning("[track=%s] duration mismatch %.1fs vs %.1fs — trying next candidate",
+                       track.filename, track.duration_sec, flac_duration)
+        # try next candidate or fall back
+        return
+
+# Step 8: FFmpeg convert (same as Phase 3B)
+UPDATE status = 'converting'
+run_ffmpeg(flac_path, output_aac_path)
+```
+
+### No-Result / Timeout Handling
+
+```python
+def handle_no_results(track):
+    if (NOW() - download_queued_at) > SLSK_TIMEOUT_HOURS * 3600:
+        logger.info("[track=%s] Soulseek timeout — falling back to Lidarr", track.filename)
+        UPDATE download_source = 'lidarr', status = 'queued'
+        # Phase 3B (Lidarr) picks it up on next loop
+    else:
+        # Re-search later
+        UPDATE status = 'slsk_searching', download_queued_at = NOW()
+```
+
+### slskd Docker config (add to docker-compose.yml)
 
 ```yaml
 slskd:
-  image: slskd/slskd
-  network_mode: "service:gluetun"   # all traffic via VPN
-  ports: []                          # ports exposed via Gluetun
+  image: slskd/slskd:latest
+  container_name: slskd
+  network_mode: "service:gluetun"    # all Soulseek traffic via VPN
+  environment:
+    SLSKD_REMOTE_CONFIGURATION: true
+    SLSKD_API_KEY: ${SLSKD_API_KEY}
+    SLSKD_DOWNLOADS_DIR: /downloads/slskd
+    SLSKD_SLSK_USERNAME: ${SLSK_USERNAME}
+    SLSKD_SLSK_PASSWORD: ${SLSK_PASSWORD}
+  volumes:
+    - ./slskd-config:/app
+    - ./downloads/slskd:/downloads/slskd
+  depends_on:
+    - gluetun
 ```
 
-Gluetun must expose slskd's port (default 5030) in addition to qBittorrent's 8080.
+Gluetun must also expose slskd's port (50300 TCP/UDP for Soulseek protocol, 5030 for WebUI):
+```yaml
+# in gluetun service ports:
+- "5030:5030"     # slskd WebUI / API
+- "50300:50300"   # Soulseek protocol port
+```
+
+### .env additions for Phase 3A
+
+```bash
+SLSKD_URL=http://localhost:5030
+SLSKD_API_KEY=<set in slskd.yml>
+SLSKD_DOWNLOAD_DIR=/Users/<you>/pipeline/downloads/slskd
+SLSK_USERNAME=<your Soulseek account username>
+SLSK_PASSWORD=<your Soulseek account password>
+SLSK_TIMEOUT_HOURS=48        # fall back to Lidarr after this
+SLSK_MIN_FILE_SIZE_MB=10     # reject files smaller than this
+SLSK_MAX_FILE_SIZE_MB=150    # reject files larger than this (whole album mislabelled)
+```
+
+> Soulseek requires a free account at slsknet.org. Username/password go in `.env` — never hardcoded.
+
+---
+
+## Phase 3B — Lidarr Fallback
+
+Triggered only when Soulseek finds nothing after `SLSK_TIMEOUT_HOURS`.
+Tracks reaching this path have `download_source = 'lidarr'`, `status = 'queued'`.
+
+Logic is identical to the original Phase 3 Lidarr sequence:
+Artist add → album find by `foreignAlbumId` → monitor → AlbumSearch → poll → extract by
+`MUSICBRAINZ_TRACKID` → FFmpeg → done. See Lidarr API Sequence section above.
 
 ---
 
@@ -1160,9 +1311,11 @@ services:
 ├── lidarr-config/
 ├── prowlarr-config/
 ├── qbt-config/
+├── slskd-config/                     # slskd config + state
 ├── pgdata/                           # PostgreSQL data files
-└── downloads/                        # FLAC temp folder — Lidarr writes here
-    └── lidarr/                       # qBittorrent category subfolder
+└── downloads/
+    ├── slskd/                        # Soulseek individual track downloads (Phase 3A — primary)
+    └── lidarr/                       # Lidarr/qBittorrent full album downloads (Phase 3B — fallback)
 ```
 
 ---
@@ -1199,6 +1352,16 @@ PHASE1_BATCH_SIZE=100
 PHASE2_BATCH_SIZE=50
 PHASE3_ALBUM_SEARCH_DELAY_SEC=10    # delay between Lidarr album searches
 POLL_INTERVAL_SEC=60                # Lidarr queue poll interval
+
+# Soulseek (Phase 3A)
+SLSKD_URL=http://localhost:5030
+SLSKD_API_KEY=<set in slskd.yml>
+SLSKD_DOWNLOAD_DIR=/Users/<you>/pipeline/downloads/slskd
+SLSK_USERNAME=<your Soulseek account — free at slsknet.org>
+SLSK_PASSWORD=<your Soulseek password>
+SLSK_TIMEOUT_HOURS=48               # fall back to Lidarr after this
+SLSK_MIN_FILE_SIZE_MB=10            # reject suspiciously small files
+SLSK_MAX_FILE_SIZE_MB=150           # reject whole-album mislabelled as single track
 ```
 
 ---
